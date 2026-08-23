@@ -3,8 +3,8 @@ ai_digest.py — Daily AI newsletter digest -> Telegram.
 
 Fetches the latest issue of three AI newsletters from their public web
 archives (NOT email — avoids mail API size limits), asks an LLM (Gemma via
-the Gemini API) to compile a Russian-language digest, and posts it to
-Telegram.
+the Gemini API) to compile a digest in the language of your choice
+(DIGEST_LANGUAGE, Russian by default), and posts it to Telegram.
 
 Sources:
   - TLDR AI          — https://tldr.tech/api/latest/ai (always redirects to
@@ -25,6 +25,7 @@ Cron (daily at 11:00 — server time):
 
 Configuration — see .env.example:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY
+  DIGEST_LANGUAGE (optional, default Russian), GEMINI_MODEL, DIGEST_DATE_FORMAT
 """
 
 import json
@@ -61,6 +62,11 @@ BROWSER_UA = (
 )
 FETCH_TIMEOUT = 20
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemma-4-31b-it")
+# Language the digest is written in — any language name the model understands
+# ("Russian", "English", "Deutsch", "français", …). The newsletters themselves
+# are English; the model translates them into this language.
+DIGEST_LANGUAGE = os.environ.get("DIGEST_LANGUAGE", "Russian")
+DATE_FORMAT = os.environ.get("DIGEST_DATE_FORMAT", "%d.%m.%Y")
 TELEGRAM_MSG_LIMIT = 3500  # stay comfortably under Telegram's 4096-char cap
 MAX_SOURCE_CHARS = 15000  # per-source cap before feeding to the model
 
@@ -222,23 +228,25 @@ def get_latest_issue(key: str, cfg: dict) -> tuple[str, str] | None:
 
 # ─── Digest compilation (Gemma via Gemini API) ──────────────────────────
 
-DIGEST_PROMPT_TEMPLATE = """Ты собираешь ежедневную сводку AI-новостей на русском языке для Telegram-канала.
+DIGEST_PROMPT_TEMPLATE = """You compile a daily AI-news digest for a Telegram channel.
 
-Ниже — полный текст свежих выпусков AI-рассылок (ссылки внутри текста в формате [текст](url)).
+Write the entire digest in {language}. The newsletters below are in English — translate and rewrite their content into {language}; do not answer in English unless {language} is English.
+
+Below is the full text of today's AI newsletter issues (links inside the text use the [text](url) format).
 
 {combined}
 
-Составь одно сообщение-сводку на русском языке для Telegram. Используй Telegram HTML-разметку:
-<b>жирный</b> для заголовков разделов, "• " в начале строки для списков, <a href="URL">текст</a> для ссылок на источники, <pre>...</pre> для промпт-шаблонов или кода. НЕ используй Markdown-заголовки (#) — Telegram их не поддерживает. Не используй вложенные теги.
+Produce ONE digest message for Telegram, written in {language}. Use Telegram HTML markup:
+<b>bold</b> for section headings, "• " at the start of list lines, <a href="URL">text</a> for source links, <pre>...</pre> for prompt templates or code. Do NOT use Markdown headings (#) — Telegram does not support them. Do not nest tags.
 
-Требования к содержанию:
-- Объединяй похожие/пересекающиеся новости из разных источников в один общий пункт.
-- Сохраняй ВСЕ типы контента, которые реально есть в выпусках, а не только новости: инструменты/находки ("что попробовать"), промпт/скилл дня (шаблон приводи целиком внутри <pre>), шутки — если они есть.
-- У каждого пункта, где в исходном тексте была ссылка на источник, статью или продукт, сохрани эту ссылку через <a href="URL">текст</a>.
-- Полностью исключи рекламные блоки: "Sponsor", "From our partners", "Advertise", промокоды, партнёрские предложения, купоны вида "Get X% off".
-- Структурируй по смысловым разделам (например: новости, инструменты, промпт дня, шутки — конкретный набор зависит от того, что реально было в выпусках).
-- В начале сообщения — заголовок <b>AI-сводка на {date}</b> и список источников, вошедших в сегодняшний выпуск: {source_names}.
-- Не добавляй пояснений о том, что ты делаешь — выведи только готовый текст сообщения.
+Content requirements:
+- Merge similar or overlapping stories from different sources into a single item.
+- Keep EVERY type of content the issues actually contain, not just news: tools/finds ("what to try"), prompt or skill of the day (quote the template in full inside <pre>), jokes — whenever they are present.
+- Wherever the source text had a link to a source, article or product, keep that link as <a href="URL">text</a>.
+- Completely drop promotional blocks: "Sponsor", "From our partners", "Advertise", promo codes, affiliate offers, coupons such as "Get X% off".
+- Structure the message into meaningful sections (for example: news, tools, prompt of the day, jokes — the exact set depends on what the issues actually contained).
+- Start the message with a bold header meaning "AI digest for {date}", written in {language}, followed by the list of sources included today: {source_names}.
+- Do not explain what you are doing — output only the finished message text.
 """
 
 
@@ -264,8 +272,9 @@ def compile_digest(new_items: dict[str, tuple[str, str]]) -> str | None:
     combined = "\n\n".join(blocks)
 
     prompt = DIGEST_PROMPT_TEMPLATE.format(
+        language=DIGEST_LANGUAGE,
         combined=combined,
-        date=datetime.now().strftime("%d.%m.%Y"),
+        date=datetime.now().strftime(DATE_FORMAT),
         source_names=", ".join(names),
     )
 

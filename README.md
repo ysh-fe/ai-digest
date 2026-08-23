@@ -1,12 +1,13 @@
 # ai-digest
 
 A small cron-friendly script that turns the day's AI newsletters into a single
-Russian-language digest and posts it to Telegram.
+digest — written in whatever language you configure — and posts it to Telegram.
 
 It reads the newsletters from their **public web archives / RSS feeds** — not
 from email — so there is no mail API, no OAuth and no message-size limit to
 work around. An LLM (Gemma via the Gemini API) merges overlapping stories,
-strips sponsor blocks, keeps the source links, and formats the result with
+strips sponsor blocks, keeps the source links, translates everything into your
+language (`DIGEST_LANGUAGE`, Russian by default), and formats the result with
 Telegram HTML markup.
 
 ## Sources
@@ -69,10 +70,19 @@ Daily at 09:00 via cron:
 | `TELEGRAM_CHAT_ID` | yes | Chat or channel id to post into |
 | `GEMINI_API_KEY` | yes | Key from [Google AI Studio](https://aistudio.google.com/apikey) |
 | `GEMINI_MODEL` | no | Model used to compile the digest (default `gemma-4-31b-it`) |
+| `DIGEST_LANGUAGE` | no | Language the digest is written in (default `Russian`) |
+| `DIGEST_DATE_FORMAT` | no | `strftime` format for the date in the header (default `%d.%m.%Y`) |
 
-The digest prompt (`DIGEST_PROMPT_TEMPLATE` in `ai_digest.py`) is written in
-Russian because it asks for a Russian-language digest — rewrite it in your own
-language to change the output language.
+The sources are English-language newsletters; the model translates them into
+`DIGEST_LANGUAGE`, so any language name it understands works — `English`,
+`Deutsch`, `français`, `日本語`:
+
+```bash
+DIGEST_LANGUAGE=English
+```
+
+The prompt itself (`DIGEST_PROMPT_TEMPLATE` in `ai_digest.py`) is English and
+language-agnostic — edit it to change the digest's structure, not its language.
 
 ## Notes
 
