@@ -1,0 +1,14 @@
+# ai-digest — Python dependencies
+# Install: pip install -r requirements.txt
+
+# HTTP (newsletter fetching + Telegram Bot API)
+requests>=2.31.0
+
+# HTML parsing / article text extraction
+beautifulsoup4>=4.12.0
+
+# Google Gemini / Gemma — digest compilation
+google-genai>=0.3.0
+
+# .env loading
+python-dotenv>=1.0.0
