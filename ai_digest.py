@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -47,9 +48,11 @@ load_dotenv(Path(__file__).parent / ".env")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    # Cron already appends stdout to ai_digest.log, so echoing to stdout there
+    # would write every line twice. Only echo when run by hand in a terminal.
     handlers=[
-        logging.StreamHandler(sys.stdout),
         logging.FileHandler(Path(__file__).parent / "ai_digest.log", encoding="utf-8"),
+        *([logging.StreamHandler(sys.stdout)] if sys.stdout.isatty() else []),
     ],
 )
 logger = logging.getLogger("ai_digest")
@@ -69,6 +72,9 @@ DIGEST_LANGUAGE = os.environ.get("DIGEST_LANGUAGE", "Russian")
 DATE_FORMAT = os.environ.get("DIGEST_DATE_FORMAT", "%d.%m.%Y")
 TELEGRAM_MSG_LIMIT = 3500  # stay comfortably under Telegram's 4096-char cap
 MAX_SOURCE_CHARS = 15000  # per-source cap before feeding to the model
+# Waits before re-trying a transient Gemini error (503 overloaded, 429, 5xx).
+GEMINI_RETRY_DELAYS = [60, 300, 900]
+GEMINI_TRANSIENT_CODES = ("429", "500", "502", "503", "504")
 
 SOURCES = {
     "tldr": {
@@ -284,18 +290,25 @@ def compile_digest(new_items: dict[str, tuple[str, str]]) -> str | None:
         thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
     )
 
-    try:
-        chunks = []
-        for chunk in client.models.generate_content_stream(
-            model=GEMINI_MODEL, contents=contents, config=config,
-        ):
-            if chunk.text:
-                chunks.append(chunk.text)
-        result = "".join(chunks).strip()
-        return result or None
-    except Exception as e:
-        logger.error(f"Gemini call failed: {e}")
-        return None
+    for attempt in range(len(GEMINI_RETRY_DELAYS) + 1):
+        try:
+            chunks = []
+            for chunk in client.models.generate_content_stream(
+                model=GEMINI_MODEL, contents=contents, config=config,
+            ):
+                if chunk.text:
+                    chunks.append(chunk.text)
+            result = "".join(chunks).strip()
+            return result or None
+        except Exception as e:
+            transient = str(e).startswith(GEMINI_TRANSIENT_CODES)
+            if not transient or attempt == len(GEMINI_RETRY_DELAYS):
+                logger.error(f"Gemini call failed: {e}")
+                return None
+            delay = GEMINI_RETRY_DELAYS[attempt]
+            logger.warning(f"Gemini call failed (attempt {attempt + 1}): {e}. Retrying in {delay}s…")
+            time.sleep(delay)
+    return None
 
 
 # ─── Telegram ────────────────────────────────────────────────────────────
@@ -319,29 +332,52 @@ def _split_for_telegram(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]
     return messages
 
 
-def send_telegram_html(bot_token: str, chat_id: str, text: str) -> bool:
-    """Sends one HTML-formatted message via the Telegram Bot API."""
+def _html_to_plain(text: str) -> str:
+    """Drops Telegram HTML markup, keeping link targets as "text (url)"."""
+    soup = BeautifulSoup(text, "html.parser")
+    for a in soup.find_all("a", href=True):
+        a.replace_with(f"{a.get_text()} ({a['href']})")
+    return soup.get_text()
+
+
+def _send_telegram(bot_token: str, chat_id: str, text: str, parse_mode: str | None) -> tuple[bool, str]:
+    """Returns (ok, error description). Never logs the request URL — it embeds the bot token."""
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": False}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         resp = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
-            timeout=15,
+            f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload, timeout=15,
         )
-        resp.raise_for_status()
         data = resp.json()
-        if not data.get("ok"):
-            logger.error(f"[Telegram] API error: {data}")
-            return False
+    except requests.RequestException as e:
+        return False, f"{type(e).__name__}"
+    except ValueError:
+        return False, f"HTTP {resp.status_code}, non-JSON response"
+    if not data.get("ok"):
+        return False, f"HTTP {resp.status_code}: {data.get('description', data)}"
+    return True, ""
+
+
+def send_telegram_html(bot_token: str, chat_id: str, text: str) -> bool:
+    """Sends one HTML-formatted message via the Telegram Bot API.
+
+    The model occasionally emits markup Telegram rejects ("can't parse
+    entities"); rather than lose the whole digest, resend that part as plain text.
+    """
+    ok, err = _send_telegram(bot_token, chat_id, text, "HTML")
+    if ok:
         logger.info("[Telegram] Message sent successfully")
         return True
-    except Exception as e:
-        logger.error(f"[Telegram] Request failed: {e}")
+    logger.error(f"[Telegram] Send failed: {err}")
+    if "parse" not in err.lower():
         return False
+    ok, err = _send_telegram(bot_token, chat_id, _html_to_plain(text), None)
+    if ok:
+        logger.warning("[Telegram] Sent as plain text after HTML was rejected")
+        return True
+    logger.error(f"[Telegram] Plain-text fallback failed: {err}")
+    return False
 
 
 # ─── Main ────────────────────────────────────────────────────────────────
@@ -365,15 +401,20 @@ def main():
         logger.info("No new issues from any source — nothing to send.")
         return
 
-    digest = compile_digest(new_items)
-    if not digest:
-        logger.error("Digest compilation failed — not sending, state not updated (will retry next run).")
-        return
-
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not bot_token or not chat_id:
         logger.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set in .env")
+        return
+
+    digest = compile_digest(new_items)
+    if not digest:
+        logger.error("Digest compilation failed — not sending, state not updated (will retry next run).")
+        # Say so in the chat, otherwise a missing digest is indistinguishable
+        # from a quiet news day.
+        _send_telegram(bot_token, chat_id,
+                       "⚠️ AI digest: LLM call failed, digest not sent today. "
+                       "Will retry on the next run — see ai_digest.log.", None)
         return
 
     all_ok = True
